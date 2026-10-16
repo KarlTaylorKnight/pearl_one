@@ -19,6 +19,7 @@ mod hooks;
 
 pub use types::*;
 pub use traits::*;
+pub use traits::futures_like;
 pub use decision::*;
 pub use role_dna::*;
 pub use registry::*;

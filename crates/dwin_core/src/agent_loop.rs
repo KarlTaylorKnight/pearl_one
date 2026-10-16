@@ -226,6 +226,15 @@ where
             call.args.clone(),
         );
 
+        // Get tier from role DNA or registry (needed for all audit records)
+        let tier = self
+            .role_dna
+            .get_risk_tier(&call.name)
+            .or_else(|| self.registry.get_risk_tier(&call.name));
+        if let Some(t) = tier {
+            audit = audit.with_tier(t);
+        }
+
         if !self.role_dna.is_tool_allowed(&call.name) {
             let reason = format!("Tool '{}' is not in the allowlist", call.name);
             audit = audit
@@ -238,14 +247,6 @@ where
                 .await
                 .map_err(|e| AgentError::StoreError(e.to_string()))?;
             return Ok(ToolOutput::error(&reason));
-        }
-
-        let tier = self
-            .role_dna
-            .get_risk_tier(&call.name)
-            .or_else(|| self.registry.get_risk_tier(&call.name));
-        if let Some(t) = tier {
-            audit = audit.with_tier(t);
         }
 
         let mut decisions = Vec::new();
@@ -270,8 +271,15 @@ where
 
         match &final_decision {
             Decision::Allow => {
-                audit = audit.with_decision("allowed").with_approver("policy");
-                let output = self.execute_tool(call).await?;
+                let reason = match tier {
+                    Some(t) => format!("policy: tier {} auto-allow", t),
+                    None => "policy: auto-allow".to_string(),
+                };
+                audit = audit
+                    .with_decision("allowed")
+                    .with_reason(&reason)
+                    .with_approver("policy");
+                let output = self.execute_tool_safe(call).await;
                 audit = audit.with_outcome(if output.is_error { "error" } else { "success" });
                 self.store
                     .audit(audit)
@@ -305,7 +313,7 @@ where
                         .with_decision("approved")
                         .with_reason(reason)
                         .with_approver(&approval.approver);
-                    let output = self.execute_tool(call).await?;
+                    let output = self.execute_tool_safe(call).await;
                     audit = audit.with_outcome(if output.is_error { "error" } else { "success" });
                     self.store
                         .audit(audit)
@@ -331,19 +339,20 @@ where
     }
 
     /// Execute a tool and return its output.
-    async fn execute_tool(&self, call: &ToolCall) -> Result<ToolOutput, AgentError> {
-        let tool = self
-            .registry
-            .get_tool(&call.name)
-            .ok_or_else(|| AgentError::ToolError(format!("Tool '{}' not found", call.name)))?;
+    /// Returns a ToolOutput even if the tool returns an error (with is_error=true).
+    async fn execute_tool_safe(&self, call: &ToolCall) -> ToolOutput {
+        let tool = match self.registry.get_tool(&call.name) {
+            Some(t) => t,
+            None => return ToolOutput::error(format!("Tool '{}' not found", call.name)),
+        };
 
         self.output.on_tool_call(call).await;
-        let output = tool
-            .call(call.args.clone())
-            .await
-            .map_err(|e| AgentError::ToolError(e.to_string()))?;
+        let output = match tool.call(call.args.clone()).await {
+            Ok(out) => out,
+            Err(e) => ToolOutput::error(format!("Tool error: {}", e)),
+        };
         self.output.on_tool_result(call, &output).await;
-        Ok(output)
+        output
     }
 
     /// Emit AfterToolCall hook event.

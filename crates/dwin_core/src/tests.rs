@@ -16,6 +16,8 @@ use crate::{
     Request, RoleDna, SessionEntry, Store, Tool, ToolCall, ToolOutput, ToolSpec, DateHook,
 };
 
+// Note: AtomicUsize and Ordering are used by AlwaysToolCallingProvider and MockApprover
+
 // =============================================================================
 // Mock Implementations
 // =============================================================================
@@ -23,19 +25,13 @@ use crate::{
 /// Mock provider that returns a sequence of events.
 struct MockProvider {
     responses: Arc<Mutex<Vec<Vec<ProviderEvent>>>>,
-    call_count: Arc<AtomicUsize>,
 }
 
 impl MockProvider {
     fn new(responses: Vec<Vec<ProviderEvent>>) -> Self {
         Self {
             responses: Arc::new(Mutex::new(responses)),
-            call_count: Arc::new(AtomicUsize::new(0)),
         }
-    }
-
-    fn call_count(&self) -> usize {
-        self.call_count.load(Ordering::SeqCst)
     }
 }
 
@@ -61,7 +57,6 @@ impl Stream for MockEventStream {
 #[async_trait]
 impl Provider for MockProvider {
     async fn stream(&self, _req: Request) -> anyhow::Result<EventStream> {
-        self.call_count.fetch_add(1, Ordering::SeqCst);
         let mut responses = self.responses.lock().unwrap();
         let events = if responses.is_empty() {
             vec![ProviderEvent::Done {
@@ -211,19 +206,11 @@ impl Store for MockStore {
 /// Mock hook that returns a specific decision for BeforeToolCall.
 struct MockHook {
     decision: Decision,
-    called: Arc<AtomicUsize>,
 }
 
 impl MockHook {
     fn new(decision: Decision) -> Self {
-        Self {
-            decision,
-            called: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn call_count(&self) -> usize {
-        self.called.load(Ordering::SeqCst)
+        Self { decision }
     }
 }
 
@@ -235,7 +222,6 @@ impl Hook for MockHook {
         _ctx: &mut HookContext<'a>,
     ) -> anyhow::Result<HookOutcome> {
         if matches!(event, HookEvent::BeforeToolCall { .. }) {
-            self.called.fetch_add(1, Ordering::SeqCst);
             Ok(HookOutcome::Decision(self.decision.clone()))
         } else {
             Ok(HookOutcome::Continue)
@@ -960,12 +946,12 @@ async fn test_card9_audit_rejected_tool() {
 }
 
 // =============================================================================
-// Card Test 10: Date hook appends today's date
+// Card Test 10: Date hook appends today's date (local time)
 // =============================================================================
 
 #[tokio::test]
 async fn test_card10_date_hook_appends_date() {
-    use chrono::Utc;
+    use chrono::Local;
 
     let hook = DateHook::new();
     let mut system_prompt = "You are an assistant.".to_string();
@@ -979,45 +965,204 @@ async fn test_card10_date_hook_appends_date() {
 
     hook.on(&event, &mut ctx).await.unwrap();
 
-    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let today = Local::now().format("%Y-%m-%d").to_string();
     assert!(
         ctx.system_prompt.contains(&format!("Current date: {}", today)),
-        "System prompt should contain today's date: {}",
+        "System prompt should contain today's local date: {}",
         ctx.system_prompt
     );
 }
 
 // =============================================================================
-// Card Test 11: Isolation - no workspace crates, no reqwest/rusqlite/std::fs
+// Card Test 9 (additional): Audit allowed record has reason
 // =============================================================================
 
-// This is verified by `cargo tree -p core` having no workspace crates
-// and no reqwest/rusqlite. The test here documents the requirement.
-#[test]
-fn test_card11_isolation_documented() {
-    // This test documents that core has no dependencies on:
-    // - Other workspace crates (providers, tools, store, policy, cli)
-    // - reqwest
-    // - rusqlite
-    // - std::fs (no file I/O)
-    //
-    // Verification: run `cargo tree -p core` and check the output
-    // The CI will run this check.
+#[tokio::test]
+async fn test_card9_audit_allowed_has_reason() {
+    let tool = Arc::new(create_read_tool());
+    let provider = MockProvider::new(vec![
+        vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "call_1".to_string(),
+                name: "read".to_string(),
+                args: serde_json::json!({"path": "test.txt"}),
+            }),
+            ProviderEvent::Done {
+                usage: Default::default(),
+            },
+        ],
+        vec![
+            ProviderEvent::TextDelta("Done".to_string()),
+            ProviderEvent::Done {
+                usage: Default::default(),
+            },
+        ],
+    ]);
+
+    let store = MockStore::new();
+    let approver = MockApprover::new(true, "test");
+    let mut registry = Registry::new();
+    registry.register_tool_arc(tool);
+
+    let mut agent = AgentLoop::new(
+        provider,
+        store.clone(),
+        approver,
+        NullOutputHandler,
+        registry,
+        create_test_role_dna(),
+        "session_1",
+    );
+
+    let _ = agent.run_turn("Read file").await.unwrap();
+
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    assert!(
+        audits[0].reason.is_some(),
+        "Allowed audit record must have a reason, got None"
+    );
+    assert!(
+        audits[0].reason.as_ref().unwrap().contains("policy"),
+        "Reason should mention policy: {:?}",
+        audits[0].reason
+    );
 }
 
 // =============================================================================
-// Card Test 12: No warnings
+// Card Test 9 (additional): Tool error still gets audited
 // =============================================================================
 
-// This is verified by `cargo clippy -p core -- -D warnings`
-// The test here documents the requirement.
-#[test]
-fn test_card12_no_warnings_documented() {
-    // This test documents that:
-    // - cargo build produces no warnings
-    // - cargo clippy -p core -- -D warnings passes
-    //
-    // Verification: run these commands in CI
+/// A tool that always returns an error.
+struct FailingTool;
+
+#[async_trait]
+impl Tool for FailingTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "read".to_string(),
+            description: "A tool that fails".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    async fn call(&self, _args: serde_json::Value) -> anyhow::Result<ToolOutput> {
+        anyhow::bail!("boom")
+    }
+}
+
+#[tokio::test]
+async fn test_card9_tool_error_still_audited() {
+    let provider = MockProvider::new(vec![
+        vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "call_1".to_string(),
+                name: "read".to_string(),
+                args: serde_json::json!({"path": "test.txt"}),
+            }),
+            ProviderEvent::Done {
+                usage: Default::default(),
+            },
+        ],
+        vec![
+            ProviderEvent::TextDelta("Got error".to_string()),
+            ProviderEvent::Done {
+                usage: Default::default(),
+            },
+        ],
+    ]);
+
+    let store = MockStore::new();
+    let approver = MockApprover::new(true, "test");
+    let mut registry = Registry::new();
+    registry.register_tool(FailingTool);
+
+    let mut agent = AgentLoop::new(
+        provider,
+        store.clone(),
+        approver,
+        NullOutputHandler,
+        registry,
+        create_test_role_dna(),
+        "session_1",
+    );
+
+    // Should NOT return an error - the tool error should be returned to the model
+    let result = agent.run_turn("Read file").await;
+    assert!(
+        result.is_ok(),
+        "Tool error should not abort the turn: {:?}",
+        result
+    );
+
+    let audits = store.audits();
+    assert_eq!(
+        audits.len(),
+        1,
+        "Tool returning Err must still produce exactly one audit record"
+    );
+    assert_eq!(audits[0].outcome, "error");
+}
+
+// =============================================================================
+// Card Test 9 (additional): Non-allowlisted tool has tier when available
+// =============================================================================
+
+#[tokio::test]
+async fn test_card9_non_allowlisted_has_tier() {
+    let read_tool = Arc::new(MockTool::new("read", "content"));
+    let bash_tool = Arc::new(MockTool::new("bash", "output"));
+
+    let provider = MockProvider::new(vec![
+        vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "call_1".to_string(),
+                name: "bash".to_string(),
+                args: serde_json::json!({"command": "ls"}),
+            }),
+            ProviderEvent::Done {
+                usage: Default::default(),
+            },
+        ],
+        vec![
+            ProviderEvent::TextDelta("Cannot run bash".to_string()),
+            ProviderEvent::Done {
+                usage: Default::default(),
+            },
+        ],
+    ]);
+
+    let store = MockStore::new();
+    let approver = MockApprover::new(true, "test");
+    let mut registry = Registry::new();
+    registry.register_tool_arc(read_tool);
+    registry.register_tool_arc(bash_tool);
+    // Set a risk tier for bash in the registry
+    registry.set_risk_tier("bash", 2);
+
+    // Role DNA only allows "read", not "bash", but bash has a tier in registry
+    let role_dna = RoleDna::new("test@fene.ae", "test", "Test", "Test").with_tool("read");
+
+    let mut agent = AgentLoop::new(
+        provider,
+        store.clone(),
+        approver,
+        NullOutputHandler,
+        registry,
+        role_dna,
+        "session_1",
+    );
+
+    let _ = agent.run_turn("Run ls").await.unwrap();
+
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].decision, "denied");
+    assert!(
+        audits[0].tier.is_some(),
+        "Non-allowlisted tool audit should have tier when available in registry"
+    );
+    assert_eq!(audits[0].tier, Some(2));
 }
 
 // =============================================================================
